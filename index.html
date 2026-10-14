@@ -131,6 +131,8 @@ h3 { font-size: 17px; }
 .pgrid > .span2 { grid-column: 1 / -1; }
 @media (min-width: 1040px) { .pgrid { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); } }
 .more-btn { align-self: center; }
+.min-rest { font-size: 13px; padding: 10px 12px; border: 1px solid var(--line-2); border-left: 3px solid var(--accent); border-radius: 4px; background: var(--panel-2); color: var(--muted); }
+.min-rest.ok { border-left-color: var(--gain); }
 @media (min-width: 1040px) { .dash-grid { grid-template-columns: 1.5fr 1fr; } }
 
 .wl { display: flex; flex-direction: column; }
@@ -2096,6 +2098,8 @@ function BulkPrices({ C, saveValues, onClose }) {
 /* ---------- PROJETOS ---------- */
 const META_TYPES = { pct: "% sobre o custo", unit: "R$ por unidade", total: "R$ no projeto inteiro", price: "Preço de venda fixo" };
 const DEFAULT_STRATS = ["Revenda rápida", "Segurar", "Giro de caixas", "Faca/Luva"];
+/* preço de anúncio sempre arredondado para cima no centavo, para não ficar abaixo da meta */
+const ceil2 = (x) => Math.ceil((+x || 0) * 100 - 1e-6) / 100;
 function projCalc(p, C, X) {
   const site = X.sites.find((x) => x.name === p.site) || { sell: 0 };
   const fee = p.net ? (+site.sell || 0) / 100 : 0;
@@ -2119,9 +2123,16 @@ function projCalc(p, C, X) {
   const meta = sum(units.map((u) => u.target));
   const realized = sum(done.map((u) => u.profit || 0));
   const doneMeta = sum(done.map((u) => u.target));
+  /* preço mínimo para o que falta: quanto ainda precisa entrar ÷ unidades restantes, recalculado a cada venda */
+  const rest = [...held, ...plan];
+  const goalNet = sum(units.filter((u) => u.status !== "traded").map((u) => u.cost + u.target));
+  const got = sum(done.map((u) => u.proceeds || 0));
+  const falta = goalNet - got;
+  const wSum = sum(rest.map((u) => u.cost + u.target)) || 0;
+  rest.forEach((u) => { const need = falta <= 0 ? 0 : wSum > 0 ? (falta * (u.cost + u.target)) / wSum : falta / rest.length; u.minList = fee < 1 ? need / (1 - fee) : need; });
   const groups = {};
-  units.forEach((u) => { const k = u.name + "|" + u.wear + "|" + (u.planned ? "p" : ""); const g = groups[k] || (groups[k] = { k, name: u.name, wear: u.wear, planned: !!u.planned, pi: u.pi, n: 0, sold: 0, cost: 0, list: 0, target: 0, realized: 0, ids: [] }); g.n++; g.cost += u.cost; g.list += u.list; g.target += u.target; if (u.status === "sold" || u.status === "reverted") { g.sold++; g.realized += u.profit || 0; } if (u.id && u.status === "held") g.ids.push(u.id); });
-  return { units, done, out, held, plan, meta, realized, doneMeta, fee, total: units.length, cost: sum(units.map((u) => u.cost)), groups: Object.values(groups) };
+  units.forEach((u) => { const k = u.name + "|" + u.wear + "|" + (u.planned ? "p" : ""); const g = groups[k] || (groups[k] = { k, name: u.name, wear: u.wear, planned: !!u.planned, pi: u.pi, n: 0, sold: 0, cost: 0, list: 0, target: 0, realized: 0, ids: [], restN: 0, minList: 0 }); g.n++; g.cost += u.cost; g.list += u.list; g.target += u.target; if (u.status === "sold" || u.status === "reverted") { g.sold++; g.realized += u.profit || 0; } if (u.id && u.status === "held") g.ids.push(u.id); if (u.minList != null) { g.restN++; g.minList += u.minList; } });
+  return { units, done, out, held, plan, meta, realized, doneMeta, fee, total: units.length, cost: sum(units.map((u) => u.cost)), groups: Object.values(groups), falta, got, goalNet, restN: rest.length, minAvg: rest.length ? sum(rest.map((u) => u.minList)) / rest.length : 0 };
 }
 
 function ProjectForm({ C, X, initial, projects, onSave, onClose }) {
@@ -2158,7 +2169,7 @@ function ProjectForm({ C, X, initial, projects, onSave, onClose }) {
           <small>Para skins que você ainda vai comprar. Quando comprar, use "Lançar compra" no projeto e os itens entram nele sozinhos.</small></div>
         <label class="field"><span>Observação</span><input class="in" value=${p.note} onInput=${(ev) => up("note", ev.target.value)} /></label>
         ${calc.total ? html`<div class="summary"><span><b>${calc.total}</b> unidades</span><span>Custo <b>${fmt(calc.cost)}</b></span><span>Meta de lucro <b class="gain">${fmtSigned(calc.meta)}</b></span><span>${p.net ? `Taxa ${br2(calc.fee * 100)}% já incluída` : "Sem taxa"}</span></div>
-          <div class="list" style="border:1px solid var(--line);border-radius:6px">${calc.groups.map((g) => html`<div class="wl-row sm" style="grid-template-columns:minmax(0,1fr) auto"><span>${g.n}× ${g.name}${g.wear ? " (" + g.wear + ")" : ""}${g.planned ? html` <span class="tag">planejada</span>` : ""}</span><span class="num">anunciar a <b>${fmt(g.list / g.n)}</b> · lucro ${fmtSigned(g.target / g.n)}/un</span></div>`)}</div>` : null}
+          <div class="list" style="border:1px solid var(--line);border-radius:6px">${calc.groups.map((g) => html`<div class="wl-row sm" style="grid-template-columns:minmax(0,1fr) auto"><span>${g.n}× ${g.name}${g.wear ? " (" + g.wear + ")" : ""}${g.planned ? html` <span class="tag">planejada</span>` : ""}</span><span class="num">anunciar a <b>${fmt(ceil2(g.list / g.n))}</b> · lucro ${fmtSigned(g.target / g.n)}/un</span></div>`)}</div>` : null}
         ${err ? html`<div class="banner" role="alert">${err}</div>` : null}
       </div>
       <div class="sheet-f"><button class="btn ghost" onClick=${onClose}>Cancelar</button><button class="btn primary" onClick=${save}>${initial ? "Salvar" : "Criar projeto"}</button></div>
@@ -2210,11 +2221,14 @@ function Projetos({ C, X, entries, onNew, go }) {
               <div><div class="row" style="justify-content:space-between;font-size:13px"><span class="muted">Vendidas</span><b class="num">${c.done.length}/${c.total}${c.plan.length ? html` <span class="faint">· ${c.plan.length} a comprar</span>` : ""}</b></div><div class="bar" style="height:8px"><span style=${`width:${pu}%;background:var(--accent)`}></span></div></div>
               <div><div class="row" style="justify-content:space-between;font-size:13px"><span class="muted">Lucro</span><b class="num"><span class=${c.realized >= 0 ? "gain" : "loss"}>${fmtSigned(c.realized)}</span> de ${fmtSigned(c.meta)}</b></div><div class="bar" style="height:8px"><span style=${`width:${pm}%;background:var(--gain)`}></span></div></div>
             </div>
+            ${p.status === "open" && c.done.length && c.restN ? html`<div class=${"min-rest " + (c.falta <= 0 ? "ok" : "")}>${c.falta <= 0
+              ? html`<b class="gain">Meta batida.</b> As ${c.restN} unidade(s) que faltam são lucro extra: qualquer venda acima de R$ 0 soma.`
+              : html`Já voltou <b class="num">${fmt(c.got)}</b> de <b class="num">${fmt(c.goalNet)}</b>. Para bater a meta, as <b>${c.restN}</b> restantes precisam render <b class="num">${fmt(c.falta)}</b>: preço mínimo ${c.groups.filter((g) => g.restN).length > 1 ? "médio " : ""}de <b class="num">${fmt(ceil2(c.minAvg))}</b>/un${c.fee ? ` anunciado no ${p.site}` : ""}${c.groups.filter((g) => g.restN).length > 1 ? " (por skin em Detalhes)" : ""}.`}</div>` : null}
             ${behind ? html`<div class="banner" style="font-size:13px">As vendas feitas renderam ${fmtSigned(c.realized)}, abaixo da meta para essas unidades (${fmtSigned(c.doneMeta)}).</div>` : null}
             ${open[p.id] ? html`<div class="scroll-x"><table class="inv" style="min-width:640px">
-              <thead><tr><th>Skin</th><th class="r">Qtd</th><th class="r">Vendidas</th><th class="r">Custo un.</th><th class="r">Anunciar a</th><th class="r">Meta/un</th><th class="r">Realizado</th><th></th></tr></thead>
+              <thead><tr><th>Skin</th><th class="r">Qtd</th><th class="r">Vendidas</th><th class="r">Custo un.</th><th class="r">Anunciar a</th><th class="r" title="Recalculado a cada venda: o mínimo para as unidades restantes ainda baterem a meta do projeto">Mínimo agora</th><th class="r">Meta/un</th><th class="r">Realizado</th><th></th></tr></thead>
               <tbody>${c.groups.map((g) => html`<tr><td><div class="name"><span>${g.name}</span><${Wear} v=${g.wear} />${g.planned ? html`<span class="tag">planejada</span>` : null}</div></td>
-                <td class="r num">${g.n}</td><td class="r num">${g.planned ? "—" : g.sold}</td><td class="r num">${fmt(g.cost / g.n)}</td><td class="r num"><b>${fmt(g.list / g.n)}</b></td><td class="r num gain">${fmtSigned(g.target / g.n)}</td>
+                <td class="r num">${g.n}</td><td class="r num">${g.planned ? "—" : g.sold}</td><td class="r num">${fmt(g.cost / g.n)}</td><td class="r num"><b>${fmt(ceil2(g.list / g.n))}</b></td><td class="r num">${g.restN ? (c.falta <= 0 ? html`<span class="gain">livre</span>` : fmt(ceil2(g.minList / g.restN))) : "—"}</td><td class="r num gain">${fmtSigned(g.target / g.n)}</td>
                 <td class=${"r num " + (g.realized >= 0 ? "gain" : "loss")}>${g.sold ? fmtSigned(g.realized) : "—"}</td>
                 <td class="r">${g.planned && p.status === "open" ? html`<button class="btn sm" onClick=${() => onNew("compra", { projectId: p.id, planIdx: g.pi, rows: [{ name: g.name, wear: g.wear, qty: String(g.n), unit: br2(g.cost / g.n) }] })}>Lançar compra</button>`
                   : g.ids.length && p.status === "open" ? html`<button class="btn sm" onClick=${() => onNew("venda", { out: g.ids })}>Vender</button>` : null}</td></tr>`)}</tbody></table></div>
