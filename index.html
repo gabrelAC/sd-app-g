@@ -131,6 +131,7 @@ h3 { font-size: 17px; }
 .pgrid > .span2 { grid-column: 1 / -1; }
 @media (min-width: 1040px) { .pgrid { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); } }
 .more-btn { align-self: center; }
+.calc-grid > * { min-width: 0; }
 .min-rest { font-size: 13px; padding: 10px 12px; border: 1px solid var(--line-2); border-left: 3px solid var(--accent); border-radius: 4px; background: var(--panel-2); color: var(--muted); }
 .min-rest.ok { border-left-color: var(--gain); }
 @media (min-width: 1040px) { .dash-grid { grid-template-columns: 1.5fr 1fr; } }
@@ -489,11 +490,13 @@ function sortEntries(list) {
 
 /* Percorre os lançamentos em ordem: saldos por carteira, itens, totais gerais e por conta.
    acctOf: { walletId: accountId } */
-function compute(entries, values, acctOf, ref) {
+/* cap (opcional): histórico de capital de antes do app. Quando vem, o "saiu do bolso" usa ele
+   no lugar do saldo inicial e das compras "só registrar" (que eram dinheiro antigo). */
+function compute(entries, values, acctOf, ref, cap) {
   values = values || {}; acctOf = acctOf || {}; ref = ref || today();
   const bal = {}, items = {}, consumers = {}, problems = {}, months = {}, acct = {};
-  let capIn = 0, capOut = 0, realized = 0, fees = 0, cashFees = 0;
-  const A = (id) => acct[id || ""] || (acct[id || ""] = { capIn: 0, capOut: 0, tIn: 0, tOut: 0, realized: 0, bal: 0, invCost: 0, invValue: 0, held: 0, locked: 0 });
+  let capIn = 0, capOut = 0, realized = 0, fees = 0, cashFees = 0, legacyIn = 0;
+  const A = (id) => acct[id || ""] || (acct[id || ""] = { capIn: 0, capOut: 0, legacyIn: 0, tIn: 0, tOut: 0, realized: 0, bal: 0, invCost: 0, invValue: 0, held: 0, locked: 0 });
   const wa = (w) => acctOf[w] || "";
   const negSince = {};
   let curDate = "";
@@ -543,7 +546,7 @@ function compute(entries, values, acctOf, ref) {
         const its = expandLots(e.itemsIn), tot = a + f, X = e.account || W;
         put(e, its, its.map((x) => (x.cost != null ? +x.cost : tot / (its.length || 1))), X);
         if (e.wallet) { add(e.wallet, -tot); move(W, X, tot); }
-        else { capIn += tot; A(X).capIn += tot; }
+        else { capIn += tot; A(X).capIn += tot; legacyIn += tot; A(X).legacyIn += tot; }
         m.compras += tot; break;
       }
       case "venda": {
@@ -607,7 +610,7 @@ function compute(entries, values, acctOf, ref) {
         if (e.wallet && a) add(e.wallet, a);
         const its = expandLots(e.itemsIn), costs = its.map((x) => +x.cost || 0);
         const X = e.account || W;
-        capIn += a + sum(costs); A(W).capIn += a; A(X).capIn += sum(costs);
+        capIn += a + sum(costs); A(W).capIn += a; A(X).capIn += sum(costs); legacyIn += a + sum(costs); A(W).legacyIn += a; A(X).legacyIn += sum(costs);
         put(e, its, costs, X); break;
       }
       case "ajuste":
@@ -627,6 +630,11 @@ function compute(entries, values, acctOf, ref) {
     const x = A(it.account);
     x.invCost += it.cost; x.invValue += it.value != null ? it.value : it.cost; x.held++; if (it.locked) x.locked++;
   }
+  if (cap && cap.on) {
+    capIn = capIn - legacyIn + (cap.in || 0); capOut += cap.out || 0;
+    for (const [id, v] of Object.entries(cap.byAcc || {})) { const x = A(id); x.capIn += v.in || 0; x.capOut += v.out || 0; }
+    for (const x of Object.values(acct)) x.capIn -= x.legacyIn;
+  }
   for (const x of Object.values(acct)) {
     x.patrimonio = x.bal + x.invValue;
     x.bolso = x.capIn - x.capOut + x.tIn - x.tOut;
@@ -639,7 +647,7 @@ function compute(entries, values, acctOf, ref) {
   const bolso = capIn - capOut;
   return {
     bal, negSince, items, held, sold, reverted, consumers, problems, months, acct,
-    capIn, capOut, bolso, realized, fees, cashFees,
+    capIn, capOut, bolso, realized, fees, cashFees, legacyIn, capOn: !!(cap && cap.on),
     invCost, invValue, unrealized: invValue - invCost,
     walletsTotal, patrimonio, resultado: patrimonio - bolso,
   };
@@ -1066,6 +1074,256 @@ function deviceName() {
   return os;
 }
 
+/* ===== CAPITAL: dinheiro que saiu do bolso e que voltou para ele (inclui o histórico de antes do app) ===== */
+const CAP_STATUS = { ok: "Concluído", refund: "Reembolsado", cancel: "Cancelado", expired: "Expirado" };
+const CAP_METHODS = ["PIX", "Cartão (Stripe)", "Mercado Pago", "Boleto", "Outro"];
+const capKey = (m) => (m.ref ? norm(m.site) + "|" + m.ref : [norm(m.site), m.kind, m.date, m.time || "", (+m.value).toFixed(2)].join("|"));
+const capWhen = (m) => Date.parse(m.date + "T" + (m.time || "00:00") + ":00");
+function capCutoff(cfg, entries) {
+  if (cfg.capitalCutoff) return cfg.capitalCutoff;
+  const c = entries.map((e) => e.createdAt || 0).filter((t) => t > 1e12);
+  return c.length ? isoLocal(Math.min(...c)) : today();
+}
+/* o que conta: concluído, não é transferência entre sites e é de antes da data em que você começou a lançar no app */
+function capAgg(list, cutoff, use) {
+  const r = { on: false, in: 0, out: 0, byAcc: {}, counted: [], after: [], bonus: 0, fees: 0 };
+  for (const m of list) {
+    if (m.status !== "ok" || m.transfer) continue;
+    if (m.date >= cutoff) { r.after.push(m); continue; }
+    r.counted.push(m);
+    const b = r.byAcc[m.account || ""] || (r.byAcc[m.account || ""] = { in: 0, out: 0 });
+    if (m.kind === "dep") { const v = (+m.value || 0) + (+m.fee || 0); r.in += v; b.in += v; r.bonus += ((+m.value || 0) * (+m.bonus || 0)) / 100; r.fees += +m.fee || 0; }
+    else { r.out += +m.value || 0; b.out += +m.value || 0; }
+  }
+  r.on = !!use && r.counted.length > 0;
+  return r;
+}
+function capTransfers(list) {
+  const sug = [];
+  const used = new Set();
+  const saq = list.filter((m) => m.kind === "saq" && m.status === "ok" && !m.transfer);
+  const dep = list.filter((m) => m.kind === "dep" && m.status === "ok" && !m.transfer);
+  for (const s of saq) {
+    const d = dep.find((x) => !used.has(x.id) && norm(x.site) !== norm(s.site) && Math.abs((+x.value) - (+s.value)) < 0.01 && Math.abs(capWhen(x) - capWhen(s)) <= 15 * 60000);
+    if (d) { used.add(d.id); sug.push([s, d]); }
+  }
+  return sug;
+}
+function parseCapital(text, X) {
+  const lines = String(text || "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length && /data/i.test(lines[0]) && /valor/i.test(lines[0])) lines.shift();
+  const accBy = (v) => { const n = norm(v); if (!n) return ""; const a = X.accounts.find((x) => norm(x.nick) === n || x.id === v || norm(x.nick).startsWith(n) || n.startsWith(norm(x.nick))); return a ? a.id : null; };
+  const st = (v) => { const n = norm(v); return !n || /conclu|aprov|^ok|pago/.test(n) ? "ok" : /reemb|estorn/.test(n) ? "refund" : /cancel/.test(n) ? "cancel" : /expir/.test(n) ? "expired" : null; };
+  const rows = [];
+  lines.forEach((l, i) => {
+    const c = l.split(/;|\t/).map((x) => x.trim());
+    const [d, h, site, conta, tipo, metodo, valor, sit, ref, bonus, taxa, transf, obs] = c;
+    const dm = String(d || "").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    const date = dm ? `${dm[3]}-${dm[2].padStart(2, "0")}-${dm[1].padStart(2, "0")}` : /^\d{4}-\d{2}-\d{2}$/.test(d || "") ? d : null;
+    const kind = /^(dep|aport|entr)/i.test(tipo || "") ? "dep" : /^(saq|retir|said)/i.test(tipo || "") ? "saq" : null;
+    const value = parseMoney(valor);
+    const account = accBy(conta);
+    const status = st(sit);
+    const err = !date ? "data inválida" : !site ? "falta o site" : !kind ? "tipo deve ser depósito ou saque" : !(value > 0) ? "valor inválido" : account === null ? `conta "${conta}" não existe` : !status ? `situação "${sit}" desconhecida` : "";
+    rows.push({ line: i + 1, err, m: err ? null : { id: uid() + i, date, time: (h || "").slice(0, 5), site, account, kind, method: metodo || "", value, status, ref: ref || "", bonus: parseMoney(bonus) || 0, fee: parseMoney(taxa) || 0, transfer: transf || "", note: obs || "" } });
+  });
+  return rows;
+}
+function capCSV(list, X) {
+  const head = "data;hora;site;conta;tipo;metodo;valor;situacao;id;bonus;taxa;transferencia;obs";
+  const body = [...list].sort((a, b) => capWhen(a) - capWhen(b)).map((m) => [fmtDate(m.date).replace(/\/(\d\d)$/, "/20$1"), m.time || "", m.site, X.nick(m.account), m.kind === "dep" ? "deposito" : "saque", m.method || "", plain(m.value), CAP_STATUS[m.status] || "", m.ref || "", m.bonus || "", m.fee ? plain(m.fee) : "", m.transfer || "", (m.note || "").replace(/;/g, ",")].join(";"));
+  return [head, ...body].join("\n");
+}
+
+function CapitalForm({ X, initial, sites, onSave, onDelete, onClose }) {
+  const [m, setM] = useState(() => initial ? { ...initial, value: br2(initial.value), fee: initial.fee ? br2(initial.fee) : "", bonus: initial.bonus ? String(initial.bonus) : "" } : { id: uid(), date: today(), time: "", site: "", account: (X.accounts[0] || {}).id || "", kind: "dep", method: "PIX", value: "", status: "ok", ref: "", bonus: "", fee: "", transfer: "", note: "" });
+  const [err, setErr] = useState("");
+  const up = (k) => (ev) => { const v = ev.target.value; setM((x) => ({ ...x, [k]: v })); setErr(""); };
+  const save = () => {
+    if (!m.site.trim()) return setErr("Informe o site.");
+    if (!(parseMoney(m.value) > 0)) return setErr("Informe o valor.");
+    onSave({ ...m, site: m.site.trim(), value: parseMoney(m.value), fee: parseMoney(m.fee) || 0, bonus: parseMoney(m.bonus) || 0 });
+  };
+  return html`<div class="overlay" onClick=${(ev) => ev.target === ev.currentTarget && onClose()}>
+    <div class="sheet" style="max-width:620px" role="dialog" aria-modal="true" aria-label="Movimento de capital">
+      <div class="sheet-h"><h2>${initial ? "Editar movimento" : "Novo movimento"}</h2><button class="btn ghost sm" onClick=${onClose} aria-label="Fechar">${ICONS.x}</button></div>
+      <div class="sheet-b">
+        <div class="types">${[["dep", "Depósito (entrou do bolso)"], ["saq", "Saque (voltou pro bolso)"]].map(([k, l]) => html`<button aria-pressed=${m.kind === k} onClick=${() => setM((x) => ({ ...x, kind: k }))}>${l}</button>`)}</div>
+        <div class="grid3">
+          <label class="field"><span>Data</span><input class="in" type="date" value=${m.date} onInput=${up("date")} /></label>
+          <label class="field"><span>Hora</span><input class="in" type="time" value=${m.time} onInput=${up("time")} /></label>
+          <label class="field"><span>Valor</span><input class="in num" inputmode="decimal" placeholder="0,00" value=${m.value} onInput=${up("value")} aria-label="Valor" /></label>
+          <label class="field"><span>Site</span><input class="in" list="cap-sites" placeholder="DashSkins.gg" value=${m.site} onInput=${up("site")} aria-label="Site" /><datalist id="cap-sites">${sites.map((s) => html`<option value=${s} />`)}</datalist></label>
+          <label class="field"><span>Conta</span><select class="in" value=${m.account} onChange=${up("account")}><option value="">Sem conta</option>${X.accounts.map((a) => html`<option value=${a.id}>${a.nick}</option>`)}</select></label>
+          <label class="field"><span>Método</span><select class="in" value=${m.method} onChange=${up("method")}>${CAP_METHODS.map((x) => html`<option value=${x}>${x}</option>`)}</select></label>
+          <label class="field"><span>Situação</span><select class="in" value=${m.status} onChange=${up("status")}>${Object.entries(CAP_STATUS).map(([k, l]) => html`<option value=${k}>${l}</option>`)}</select></label>
+          <label class="field"><span>ID no site</span><input class="in" placeholder="opcional" value=${m.ref} onInput=${up("ref")} /></label>
+          ${m.kind === "dep" ? html`<label class="field"><span>Bônus do site (%)</span><input class="in num" inputmode="decimal" placeholder="0" value=${m.bonus} onInput=${up("bonus")} /></label>
+          <label class="field"><span>Taxa do cartão/IOF (R$)</span><input class="in num" inputmode="decimal" placeholder="0,00" value=${m.fee} onInput=${up("fee")} /><small>soma ao que saiu do bolso</small></label>` : null}
+        </div>
+        <label class="field"><span>Observação</span><input class="in" value=${m.note} onInput=${up("note")} /></label>
+        ${m.transfer ? html`<div class="banner" style="font-size:13px">Marcado como transferência entre sites: não conta como dinheiro novo nem como retirada. <button class="linkbtn" onClick=${() => setM((x) => ({ ...x, transfer: "" }))}>Desmarcar</button></div>` : null}
+        ${err ? html`<div class="banner" role="alert">${err}</div>` : null}
+      </div>
+      <div class="sheet-f">${initial ? html`<button class="btn danger" style="margin-right:auto" onClick=${() => onDelete(initial)}>Apagar</button>` : null}<button class="btn ghost" onClick=${onClose}>Cancelar</button><button class="btn primary" onClick=${save}>Salvar</button></div>
+    </div></div>`;
+}
+
+function CapitalChart({ list, cutoff, entries, X, patrimonio, accFilter }) {
+  const pts = useMemo(() => {
+    const ev = [];
+    list.forEach((m) => { if (m.status !== "ok" || m.transfer || m.date >= cutoff || (accFilter && m.account !== accFilter)) return; ev.push([m.date.slice(0, 7), m.kind === "dep" ? (+m.value || 0) + (+m.fee || 0) : -(+m.value || 0)]); });
+    entries.forEach((e) => { if ((e.type !== "aporte" && e.type !== "saque") || (accFilter && X.accOfWallet(e.wallet) !== accFilter)) return; ev.push([e.date.slice(0, 7), e.type === "aporte" ? +e.amount || 0 : -((+e.amount || 0) - (+e.fee || 0))]); });
+    if (!ev.length) return [];
+    const first = ev.map((x) => x[0]).sort()[0];
+    const by = {}; ev.forEach(([k, v]) => { by[k] = (by[k] || 0) + v; });
+    const out = []; let acc = 0; const d = new Date(first + "-01T12:00:00"); const end = today().slice(0, 7);
+    while (isoLocal(d.getTime()).slice(0, 7) <= end) { const k = isoLocal(d.getTime()).slice(0, 7); acc += by[k] || 0; out.push({ m: k, v: acc }); d.setMonth(d.getMonth() + 1); }
+    return out;
+  }, [list, cutoff, entries, accFilter]);
+  if (pts.length < 2) return html`<p class="muted" style="margin:0">Aparece quando houver movimentos em pelo menos dois meses.</p>`;
+  const mx = Math.max(1, patrimonio, ...pts.map((p) => p.v)), mn = Math.min(0, ...pts.map((p) => p.v));
+  const W = 640, H = 230, pl = 64, pr = 10, pt = 12, pb = 26, iw = W - pl - pr, ih = H - pt - pb;
+  const x = (i) => pl + (i / (pts.length - 1)) * iw, y = (v) => pt + ih - ((v - mn) / (mx - mn || 1)) * ih;
+  const path = pts.map((p, i) => (i ? "L" : "M") + x(i).toFixed(1) + " " + y(p.v).toFixed(1)).join(" ");
+  const step = Math.ceil(pts.length / 8);
+  return html`<div class="legend"><span><i style="background:var(--accent)"></i>Dinheiro investido (acumulado)</span><span><i style="background:var(--gain)"></i>Patrimônio hoje</span></div>
+    <svg class="chart" viewBox=${`0 0 ${W} ${H}`} style="width:100%;height:auto;margin-top:8px" role="img" aria-label="Dinheiro investido acumulado">
+      ${[mn, (mn + mx) / 2, mx].map((v) => html`<line x1=${pl} x2=${W - pr} y1=${y(v)} y2=${y(v)} stroke="var(--line)" stroke-dasharray="3 4" /><text x=${pl - 8} y=${y(v) + 4} text-anchor="end">${PRIV.on ? "••" : "R$ " + COMPACT.format(v)}</text>`)}
+      <path d=${path + ` L${x(pts.length - 1).toFixed(1)} ${y(mn).toFixed(1)} L${x(0).toFixed(1)} ${y(mn).toFixed(1)} Z`} fill="var(--accent)" opacity="0.08" />
+      <path d=${path} fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" />
+      <line x1=${pl} x2=${W - pr} y1=${y(patrimonio)} y2=${y(patrimonio)} stroke="var(--gain)" stroke-width="2" stroke-dasharray="6 4" />
+      ${pts.map((p, i) => ((i % step === 0 && pts.length - 1 - i >= step / 2) || i === pts.length - 1 ? html`<text x=${x(i)} y=${H - 6} text-anchor="middle">${monthLabel(p.m)}</text>` : null))}
+    </svg><p class="faint" style="margin:6px 0 0;font-size:12px">A distância entre a linha tracejada e o fim da curva é o seu resultado de verdade: o que você tem hoje menos o que investiu.</p>`;
+}
+
+function Capital({ C, X, entries, accFilter, setAccFilter, saveConfig, capital, saveCapital, toast }) {
+  const cutoff = capCutoff(X.cfg, entries);
+  const agg = useMemo(() => capAgg(capital, cutoff, X.cfg.capitalUse), [capital, cutoff, X.cfg.capitalUse]);
+  const [form, setForm] = useState(null);
+  const [imp, setImp] = useState(false);
+  const [text, setText] = useState("");
+  const [parsed, setParsed] = useState(null);
+  const [adj, setAdj] = useState(!capital.length);
+  const [f, setF] = useState({ q: "", kind: "", status: "", site: "", year: "" });
+  const [limit, setLimit] = useState(100);
+  const fileRef = useRef(null);
+  const sites = [...new Set(capital.map((m) => m.site))].sort();
+  const years = [...new Set(capital.map((m) => m.date.slice(0, 4)))].sort().reverse();
+  const inAcc = (m) => !accFilter || m.account === accFilter;
+  const counted = agg.counted.filter(inAcc);
+  const appIn = sum(entries.filter((e) => e.type === "aporte" && (!accFilter || X.accOfWallet(e.wallet) === accFilter)).map((e) => +e.amount || 0));
+  const appOut = sum(entries.filter((e) => e.type === "saque" && (!accFilter || X.accOfWallet(e.wallet) === accFilter)).map((e) => (+e.amount || 0) - (+e.fee || 0)));
+  const histIn = sum(counted.filter((m) => m.kind === "dep").map((m) => (+m.value || 0) + (+m.fee || 0)));
+  const histOut = sum(counted.filter((m) => m.kind === "saq").map((m) => +m.value || 0));
+  const totIn = histIn + appIn, totOut = histOut + appOut, net = totIn - totOut;
+  const pat = accFilter ? (C.acct[accFilter] || EMPTY_ACC).patrimonio : C.patrimonio;
+  const ret = totIn > 0 ? ((pat + totOut - totIn) / totIn) * 100 : null;
+  const back = totIn > 0 ? (totOut / totIn) * 100 : 0;
+  const est = +X.cfg.capitalEstimate || 0;
+  const sug = capTransfers(capital);
+  const group = (keyFn) => { const g = {}; counted.forEach((m) => { const k = keyFn(m); const x = g[k] || (g[k] = { k, nd: 0, dep: 0, ns: 0, saq: 0 }); if (m.kind === "dep") { x.nd++; x.dep += (+m.value || 0) + (+m.fee || 0); } else { x.ns++; x.saq += +m.value || 0; } }); return Object.values(g).sort((a, b) => b.dep - a.dep); };
+  const SumTable = ({ title, rows, label }) => html`<section class="panel"><div class="panel-h"><h3>${title}</h3></div><div class="scroll-x"><table class="inv" style="min-width:360px">
+    <thead><tr><th>${label}</th><th class="r">Depósitos</th><th class="r">Saques</th><th class="r">Líquido</th></tr></thead>
+    <tbody>${rows.map((r) => html`<tr><td>${r.k}</td><td class="r num">${fmt(r.dep)} <span class="faint">(${r.nd})</span></td><td class="r num">${fmt(r.saq)} <span class="faint">(${r.ns})</span></td><td class="r num"><b>${fmt(r.dep - r.saq)}</b></td></tr>`)}
+      <tr><td><b>Total</b></td><td class="r num"><b>${fmt(sum(rows.map((r) => r.dep)))}</b></td><td class="r num"><b>${fmt(sum(rows.map((r) => r.saq)))}</b></td><td class="r num"><b>${fmt(sum(rows.map((r) => r.dep - r.saq)))}</b></td></tr></tbody></table></div></section>`;
+  const nq = norm(f.q);
+  const list = [...capital].filter((m) => inAcc(m) && (!f.kind || m.kind === f.kind) && (!f.status || (f.status === "transfer" ? m.transfer : m.status === f.status)) && (!f.site || m.site === f.site) && (!f.year || m.date.startsWith(f.year)) && (!nq || norm(m.site + " " + m.ref + " " + m.note + " " + m.method).includes(nq) || plain(m.value).includes(f.q))).sort((a, b) => capWhen(b) - capWhen(a));
+  const saveM = (m) => { saveCapital((l) => (l.some((x) => x.id === m.id) ? l.map((x) => (x.id === m.id ? m : x)) : [...l, m])); setForm(null); toast("Movimento salvo"); };
+  const delM = (m) => X.ask({ title: "Apagar movimento?", text: `${m.kind === "dep" ? "Depósito" : "Saque"} de ${fmt(m.value)} em ${fmtDate(m.date)} no ${m.site}.`, ok: "Apagar", danger: true, onOk: () => { saveCapital((l) => l.filter((x) => x.id !== m.id)); setForm(null); } });
+  const keys = new Set(capital.map(capKey));
+  const readImp = () => { const rows = parseCapital(text, X); const seen = new Set(keys); rows.forEach((r) => { if (r.m) { const k = capKey(r.m); r.dup = seen.has(k); seen.add(k); } }); setParsed(rows); };
+  const okRows = parsed ? parsed.filter((r) => r.m && !r.dup) : [];
+  const doImp = () => {
+    const map = {}; const rows = okRows.map((r) => { const m = r.m; if (m.transfer) m.transfer = map[m.transfer] || (map[m.transfer] = "T" + uid()); return m; });
+    saveCapital((l) => [...l, ...rows]); toast(`${rows.length} movimentos importados`); setParsed(null); setText(""); setImp(false);
+  };
+  const markT = (a, b) => { const t = "T" + uid(); saveCapital((l) => l.map((x) => (x.id === a.id || x.id === b.id ? { ...x, transfer: t } : x))); toast("Marcado como transferência"); };
+  const onFile = (file) => { if (!file) return; const r = new FileReader(); r.onload = () => { setText(String(r.result).replace(/^﻿/, "")); setParsed(null); }; r.readAsText(file); };
+  const exportCSV = () => { saveFileLocal(`skindesk-capital-${today()}.csv`, "﻿" + capCSV(capital, X), "text/csv"); toast("CSV salvo na pasta de downloads"); };
+  const ignored = agg.after.filter(inAcc);
+  return html`<div class="stack">
+    ${form ? html`<${CapitalForm} X=${X} initial=${form === "new" ? null : form} sites=${sites} onSave=${saveM} onDelete=${delM} onClose=${() => setForm(null)} />` : null}
+    <header class="row" style="justify-content:space-between">
+      <div><h1>Capital</h1><div class="muted">O que saiu do seu bolso e o que voltou, desde o primeiro depósito.</div></div>
+      <div class="row">${capital.length ? html`<button class="btn ghost" onClick=${exportCSV}>Exportar CSV</button>` : null}<button class="btn" onClick=${() => setImp(!imp)}>Importar</button><button class="btn primary" onClick=${() => setForm("new")}>${ICONS.plus} Movimento</button></div>
+    </header>
+    <${AccFilter} accounts=${X.accounts} value=${accFilter} onChange=${setAccFilter} />
+
+    <section class="kpis" aria-label="Capital">
+      <div class="kpi"><span class="label">Entrou do bolso</span><span class="v">${fmt(totIn)}</span><span class="s">${fmt(histIn)} histórico${appIn ? ` · ${fmt(appIn)} no app` : ""}</span></div>
+      <div class="kpi"><span class="label">Voltou pro bolso</span><span class="v">${fmt(totOut)}</span><span class="s">${back.toFixed(1).replace(".", ",")}% do que entrou</span></div>
+      <div class="kpi"><span class="label">Líquido investido</span><span class="v">${fmt(net)}</span><span class="s">patrimônio hoje ${fmt(pat)}</span></div>
+      <div class="kpi"><span class="label">Retorno real</span><span class=${"v " + (ret == null ? "" : ret >= 0 ? "gain" : "loss")}>${ret == null ? "—" : pct(ret)}</span><span class="s">${ret == null ? "sem depósitos ainda" : `${fmtSigned(pat + totOut - totIn)} sobre o que entrou`}</span></div>
+    </section>
+
+    ${est ? html`<section class="panel"><div class="panel-b stack" style="gap:6px">
+      <div class="row" style="justify-content:space-between;font-size:14px"><span class="muted">Comprovado por prints × estimativa</span><b class="num">${fmt(histIn + appIn)} de ${fmt(est)} (${Math.round(((histIn + appIn) / est) * 100)}%)</b></div>
+      <div class="bar" style="height:8px"><span style=${`width:${Math.min(100, ((histIn + appIn) / est) * 100)}%;background:var(--accent)`}></span></div>
+      <span class="faint" style="font-size:12px">${histIn + appIn < est ? `Faltam ${fmt(est - histIn - appIn)} em depósitos para bater a sua estimativa: ainda há sites sem print?` : "Os depósitos comprovados já passam da estimativa."}</span></div></section>` : null}
+
+    ${agg.bonus || agg.fees || ignored.length ? html`<div class="summary">${agg.bonus ? html`<span>Bônus de depósito recebidos <b class="gain">${fmt(agg.bonus)}</b></span>` : null}${agg.fees ? html`<span>Taxas de cartão/IOF <b class="loss">${fmt(agg.fees)}</b></span>` : null}${ignored.length ? html`<span title="Movimentos a partir da data em que você começou a lançar no app: já entram como aporte/saque normais">${ignored.length} depois do corte (não somados)</span>` : null}</div>` : null}
+
+    ${sug.length ? html`<section class="panel"><div class="panel-h"><h3>Parece transferência entre sites</h3></div><div class="list">
+      ${sug.map(([s, d]) => html`<div class="wl-row" style="grid-template-columns:minmax(0,1fr) auto"><span>Saque de <b class="num">${fmt(s.value)}</b> no ${s.site} (${fmtDate(s.date)} ${s.time}) e depósito igual no ${d.site} (${d.time}). Se foi só passar o dinheiro de um site pro outro, não é dinheiro novo nem retirada.</span>
+        <button class="btn sm primary" onClick=${() => markT(s, d)}>Marcar como transferência</button></div>`)}</div></section>` : null}
+
+    ${imp ? html`<section class="panel"><div class="panel-b stack" style="gap:10px">
+      <h3>Importar movimentos</h3>
+      <p class="muted" style="margin:0;font-size:14px">Cole as linhas ou escolha um arquivo .csv. Uma linha por movimento, separando por ponto e vírgula. Repetidos (mesmo site e ID, ou mesma data, hora e valor) são ignorados.</p>
+      <code style="display:block;padding:10px;overflow-x:auto;white-space:pre;font-size:12px">data;hora;site;conta;tipo;metodo;valor;situacao;id;bonus;taxa;transferencia;obs${"\n"}22/02/2024;13:20;DashSkins.gg;${(X.accounts[1] || X.accounts[0] || {}).nick || ""};deposito;PIX;10,00;Concluido;;;;;</code>
+      <textarea class="in" placeholder="Cole aqui" value=${text} onInput=${(ev) => { setText(ev.target.value); setParsed(null); }} aria-label="Linhas de capital"></textarea>
+      <div class="row"><button class="btn" onClick=${() => { fileRef.current.value = ""; fileRef.current.click(); }}>Escolher arquivo</button><input ref=${fileRef} type="file" accept=".csv,.txt,text/csv" hidden onChange=${(ev) => onFile(ev.target.files[0])} aria-label="Arquivo de capital" />
+        <button class="btn" disabled=${!text.trim()} onClick=${readImp}>Ler linhas</button>
+        ${parsed ? html`<button class="btn primary" disabled=${!okRows.length} onClick=${doImp}>Importar ${okRows.length}</button>` : null}</div>
+      ${parsed ? html`<div class="summary"><span><b>${okRows.length}</b> novos</span><span><b>${parsed.filter((r) => r.dup).length}</b> repetidos</span><span class=${parsed.some((r) => r.err) ? "loss" : ""}><b>${parsed.filter((r) => r.err).length}</b> com erro</span><span>Depósitos ${fmt(sum(okRows.filter((r) => r.m.kind === "dep" && r.m.status === "ok").map((r) => r.m.value)))}</span><span>Saques ${fmt(sum(okRows.filter((r) => r.m.kind === "saq" && r.m.status === "ok").map((r) => r.m.value)))}</span></div>
+        ${parsed.some((r) => r.err) ? html`<div class="banner" style="font-size:13px">${parsed.filter((r) => r.err).slice(0, 8).map((r) => html`<div>Linha ${r.line}: ${r.err}</div>`)}</div>` : null}` : null}
+    </div></section>` : null}
+
+    <div class="calc-grid">
+      <section class="panel"><div class="panel-b stack" style="gap:8px"><h3>Investido × patrimônio</h3><${CapitalChart} list=${capital} cutoff=${cutoff} entries=${entries} X=${X} patrimonio=${pat} accFilter=${accFilter} /></div></section>
+      <section class="panel"><div class="panel-b stack" style="gap:10px">
+        <div class="row" style="justify-content:space-between"><h3>Ajustes</h3><button class="btn sm ghost" onClick=${() => setAdj(!adj)}>${adj ? "Esconder" : "Mostrar"}</button></div>
+        ${adj ? html`<label class="row" style="gap:10px;cursor:pointer;align-items:flex-start"><input type="checkbox" class="ck" checked=${X.cfg.capitalUse} onChange=${(ev) => saveConfig({ capitalUse: ev.target.checked })} aria-label="Usar no resultado" /><span><b>Usar no resultado do app</b><br/><span class="faint" style="font-size:13px">O "saiu do bolso" do Painel passa a ser este histórico, no lugar do custo do saldo inicial. Assim o resultado mostra o lucro desde o primeiro depósito.</span></span></label>
+          <div class="grid2">
+            <label class="field"><span>Comecei a lançar no app em</span><input class="in" type="date" value=${cutoff} onInput=${(ev) => saveConfig({ capitalCutoff: ev.target.value })} aria-label="Data de corte" /><small>Daqui pra frente, use aporte e saque normais. Movimentos do histórico nesta data ou depois não somam, para não contar duas vezes.</small></label>
+            <label class="field"><span>Quanto acho que investi (R$)</span><input class="in num" inputmode="decimal" placeholder="90.000,00" value=${est ? br2(est) : ""} onChange=${(ev) => saveConfig({ capitalEstimate: parseMoney(ev.target.value) })} aria-label="Estimativa" /><small>só para comparar com o comprovado</small></label>
+          </div>
+` : html`<p class="faint" style="margin:0;font-size:13px">${X.cfg.capitalUse ? "Usando no resultado" : "Não está entrando no resultado"} · corte em ${fmtDate(cutoff)}</p>`}
+      </div></section>
+    </div>
+
+    ${counted.length ? html`<div class="calc-grid">
+      <${SumTable} title="Por site" label="Site" rows=${group((m) => m.site)} />
+      <${SumTable} title=${accFilter ? "Por ano" : "Por conta"} label=${accFilter ? "Ano" : "Conta"} rows=${accFilter ? group((m) => m.date.slice(0, 4)) : group((m) => X.nick(m.account) || "Sem conta")} />
+    </div>
+    <div class="calc-grid">
+      ${accFilter ? null : html`<${SumTable} title="Por ano" label="Ano" rows=${group((m) => m.date.slice(0, 4))} />`}
+      <${SumTable} title="Por método" label="Método" rows=${group((m) => m.method || "—")} />
+    </div>` : null}
+
+    <section class="panel">
+      <div class="panel-h"><h3>Movimentos</h3><span class="faint" style="font-size:12px">${list.length} de ${capital.length}</span></div>
+      <div class="filters" style="padding:0 16px 12px">
+        <input class="in search" type="search" placeholder="Buscar site, ID, valor" value=${f.q} onInput=${(ev) => { const v = ev.target.value; setF((x) => ({ ...x, q: v })); }} aria-label="Buscar movimento" />
+        <select class="in" value=${f.kind} onChange=${(ev) => { const v = ev.target.value; setF((x) => ({ ...x, kind: v })); }} aria-label="Tipo de movimento"><option value="">Depósitos e saques</option><option value="dep">Só depósitos</option><option value="saq">Só saques</option></select>
+        <select class="in" value=${f.status} onChange=${(ev) => { const v = ev.target.value; setF((x) => ({ ...x, status: v })); }} aria-label="Situação"><option value="">Todas as situações</option>${Object.entries(CAP_STATUS).map(([k, l]) => html`<option value=${k}>${l}</option>`)}<option value="transfer">Transferências</option></select>
+        <select class="in" value=${f.site} onChange=${(ev) => { const v = ev.target.value; setF((x) => ({ ...x, site: v })); }} aria-label="Site do movimento"><option value="">Todos os sites</option>${sites.map((s) => html`<option value=${s}>${s}</option>`)}</select>
+        <select class="in" value=${f.year} onChange=${(ev) => { const v = ev.target.value; setF((x) => ({ ...x, year: v })); }} aria-label="Ano do movimento"><option value="">Todos os anos</option>${years.map((y) => html`<option value=${y}>${y}</option>`)}</select>
+      </div>
+      ${list.length ? html`<div class="scroll-x"><table class="inv" style="min-width:720px">
+        <thead><tr><th>Data</th><th>Site</th><th>Conta</th><th>Tipo</th><th>Método</th><th class="r">Valor</th><th>Situação</th></tr></thead>
+        <tbody>${list.slice(0, limit).map((m) => html`<tr key=${m.id} class="clickrow" onClick=${() => setForm(m)} title="Clique para editar">
+          <td class="num">${fmtDate(m.date)}<span class="faint" style="font-size:12px"> ${m.time || ""}</span></td><td>${m.site}${m.ref ? html`<div class="faint" style="font-size:11px">${m.ref}</div>` : null}</td><td><${AccChip} a=${X.acc(m.account)} /></td>
+          <td><span class=${m.kind === "dep" ? "" : "warn-t"}>${m.kind === "dep" ? "Depósito" : "Saque"}</span></td><td class="muted">${m.method}</td>
+          <td class=${"r num " + (m.status !== "ok" || m.transfer ? "faint" : m.kind === "dep" ? "" : "gain")} style=${m.status !== "ok" ? "text-decoration:line-through" : ""}>${m.kind === "saq" ? "−" : ""}${fmt(m.value)}${m.bonus ? html`<div class="gain" style="font-size:11px">+${br2(m.bonus)}% bônus</div>` : null}</td>
+          <td>${m.transfer ? html`<span class="tag">transferência</span>` : m.status === "ok" ? (m.date >= cutoff ? html`<span class="tag" title="Já entra como aporte/saque do app">após o corte</span>` : html`<span class="gain">Concluído</span>`) : html`<span class="faint">${CAP_STATUS[m.status]}</span>`}</td></tr>`)}</tbody></table></div>
+        <div style="padding:0 16px 12px"><${More} left=${Math.max(0, list.length - limit)} onMore=${() => setLimit((l) => l + 200)} /></div>`
+        : html`<div class="empty"><h3>${capital.length ? "Nada nesse filtro" : "Nenhum movimento ainda"}</h3><p class="muted" style="margin:0">${capital.length ? "Mude os filtros acima." : "Importe o histórico dos sites ou adicione movimento por movimento."}</p></div>`}
+    </section>
+  </div>`;
+}
+
 /* ===== Interface ===== */
 const { html, render, useState, useEffect, useMemo, useRef } = htmPreact;
 
@@ -1105,6 +1363,7 @@ const ICONS = {
   eye: ico(html`<path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z" /><circle cx="12" cy="12" r="3" />`),
   eyeOff: ico(html`<path d="M3 3l18 18M10.6 5.1A10.8 10.8 0 0112 5c6.5 0 10 7 10 7a17.6 17.6 0 01-3.2 4.2M6.1 6.1C3.6 7.8 2 12 2 12s3.5 7 10 7c1.8 0 3.4-.5 4.8-1.3M9.9 9.9a3 3 0 004.2 4.2" />`),
   relatorios: ico(html`<path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />`),
+  capital: ico(html`<rect x="3" y="6" width="18" height="13" rx="2" /><path d="M3 10h18M7 15h4M16 3v3M8 3v3" />`),
   min: ico(html`<path d="M5 19h14" />`),
   box: ico(html`<path d="M3 7l9-4 9 4v10l-9 4-9-4zM3 7l9 4 9-4M12 11v10" />`),
   undo: ico(html`<path d="M9 14L4 9l5-5M4 9h11a5 5 0 010 10h-3" />`),
@@ -1118,6 +1377,7 @@ const VIEWS = [
   { id: "historico", label: "Histórico", short: "Hist." },
   { id: "projetos", label: "Projetos", short: "Proj." },
   { id: "relatorios", label: "Relatórios", short: "Relat." },
+  { id: "capital", label: "Capital", short: "Capital" },
   { id: "calculadora", label: "Calculadora", short: "Calc." },
   { id: "taxas", label: "Taxas" },
   { id: "config", label: "Config" },
@@ -1267,6 +1527,9 @@ function normalizeConfig(c) {
   c.unitChecks = c.unitChecks || {};
   c.hiddenViews = (c.hiddenViews || []).filter((v) => v !== "painel" && v !== "config");
   c.panelBlocks = c.panelBlocks || [];
+  c.capitalUse = c.capitalUse ?? true;
+  c.capitalCutoff = c.capitalCutoff || "";
+  c.capitalEstimate = c.capitalEstimate || 0;
   c.defaultSellSite = c.defaultSellSite ?? ((c.sites.find((x) => x.name !== "Steam") || c.sites[0] || {}).name || "");
   return c;
 }
@@ -1323,6 +1586,7 @@ function useStore(toast) {
   const recon = useMemo(() => (data["meta/recon"] || {}).r || [], [data]);
   const projects = useMemo(() => (data["meta/projects"] || {}).p || [], [data]);
   const wish = useMemo(() => (data["meta/wish"] || {}).w || [], [data]);
+  const capital = useMemo(() => (data["meta/capital"] || {}).c || [], [data]);
   const audit = useMemo(() => (data["meta/audit"] || {}).a || [], [data]);
   const commit = (next) => {
     setData(next);
@@ -1413,6 +1677,7 @@ function useStore(toast) {
   });
   const saveProjects = (fn) => saveDoc("meta/projects", "p", fn);
   const saveWish = (fn) => saveDoc("meta/wish", "w", fn);
+  const saveCapital = (fn) => saveDoc("meta/capital", "c", fn);
   const addRecon = (rows) => setData((cur) => {
     const next = { ...cur, "meta/recon": { r: [...rows, ...(((cur["meta/recon"] || {}).r) || [])].slice(0, 500) } };
     try { writeLocal(next); } catch (e) {}
@@ -1441,7 +1706,7 @@ function useStore(toast) {
     try { writeLocal(next); } catch (e) { toast("Não salvou."); }
     return next;
   });
-  return { replaceAll, loaded, storeMode: STORE.mode, data, months, config, values, meta, prices, recon, change, saveConfig, saveValues, saveMeta, addRecon, backup, restore, undo, undoCount, undoLabel, trash, purgeTrash, projects, wish, audit, saveProjects, saveWish };
+  return { replaceAll, loaded, storeMode: STORE.mode, data, months, config, values, meta, prices, recon, change, saveConfig, saveValues, saveMeta, addRecon, backup, restore, undo, undoCount, undoLabel, trash, purgeTrash, projects, wish, audit, saveProjects, saveWish, capital, saveCapital };
 }
 
 /* ---------- utilidades de exibição ---------- */
@@ -1641,7 +1906,7 @@ function Painel({ C, entries, X, accFilter, setAccFilter, onNew, onOpen, go, cha
     <//>`,
     kpis: () => html`<section class="kpis" aria-label="Números principais">
       <div class="kpi"><span class="label">Patrimônio</span><span class="v">${fmt(N.patrimonio)}</span><span class="s">saldos + inventário</span></div>
-      <div class="kpi"><span class="label">${selAcc ? "Entrou na conta" : "Saiu do bolso"}</span><span class="v">${fmt(N.bolso)}</span><span class="s">${selAcc ? "aportes e transferências" : `${fmt(C.capIn)} entrou · ${fmt(C.capOut)} voltou`}</span></div>
+      <div class="kpi"><span class="label">${selAcc ? "Entrou na conta" : "Saiu do bolso"}</span><span class="v">${fmt(N.bolso)}</span><span class="s">${selAcc ? (C.capOn ? "histórico de capital + aportes" : "aportes e transferências") : `${fmt(C.capIn)} entrou · ${fmt(C.capOut)} voltou${C.capOn ? " · desde o 1º depósito" : ""}`}</span></div>
       <div class="kpi"><span class="label">Saldo nos sites</span><span class="v">${fmt(N.bal - negSum)}</span><span class="s">${negSum < -0.005 ? html`<span class="warn-t">${fmt(-negSum)} gasto sem origem lançada</span>` : `${X.wallets.filter((w) => !accFilter || w.account === accFilter).length} carteiras`}</span></div>
       <div class="kpi"><span class="label">Inventário</span><span class="v">${fmt(N.inv)}</span><span class="s">${N.held} itens${N.locked ? ` · ${N.locked} travados` : ""}</span></div>
     </section>`,
@@ -2895,7 +3160,11 @@ function buildSheets(entries, C, X) {
   const now = new Date().toLocaleString("pt-BR");
   X.accounts.forEach((a) => { const x = C.acct[a.id] || EMPTY_ACC; resumo.push([a.nick, r2(x.bal), r2(x.invCost), r2(x.invValue), r2(x.patrimonio), r2(x.realized), r2(x.resultado), x.held, x.locked, now]); });
   resumo.push(["TOTAL", r2(C.walletsTotal), r2(C.invCost), r2(C.invValue), r2(C.patrimonio), r2(C.realized), r2(C.resultado), C.held.length, C.held.filter((h) => h.locked).length, now]);
-  return { Resumo: resumo, Compras: compras, Itens: itens, "Lançamentos": lanc };
+  const capRows = [["Data", "Hora", "Site", "Conta", "Tipo", "Método", "Valor", "Situação", "Transferência", "Bônus %", "Taxa cartão", "ID", "Obs"]];
+  [...(X.capital || [])].sort((a, b) => capWhen(a) - capWhen(b)).forEach((m) => capRows.push([m.date, m.time || "", m.site, X.nick(m.account), m.kind === "dep" ? "Depósito" : "Saque", m.method || "", r2(m.value), CAP_STATUS[m.status] || "", m.transfer ? "sim" : "", m.bonus || "", m.fee ? r2(m.fee) : "", m.ref || "", m.note || ""]));
+  const out = { Resumo: resumo, Compras: compras, Itens: itens, "Lançamentos": lanc };
+  if (capRows.length > 1) out.Capital = capRows;
+  return out;
 }
 
 const SCRIPT_VERSION = 2;
@@ -3294,7 +3563,8 @@ function Dados({ onOpen, C, entries, X, saveConfig, change, toast, backup, resto
     const V = C.sold.concat(C.reverted).map((it) => ({ Skin: it.name, Desgaste: it.wear, Conta: X.nick(it.account), Situação: it.status === "sold" ? "vendido" : "revertido", Comprou: it.acquired, Saiu: it.outDate, Onde: X.wl(it.outWallet), Custo: +it.cost.toFixed(2), Recebeu: +it.proceeds.toFixed(2), Lucro: +it.profit.toFixed(2) }));
     const R = X.accounts.map((a) => { const x = C.acct[a.id] || EMPTY_ACC; return { Conta: a.nick, "Saldo nos sites": +x.bal.toFixed(2), "Inventário (valor)": +x.invValue.toFixed(2), Patrimônio: +x.patrimonio.toFixed(2), "Lucro realizado": +x.realized.toFixed(2), Resultado: +x.resultado.toFixed(2), Itens: x.held }; });
     R.push({ Conta: "TOTAL", "Saldo nos sites": +C.walletsTotal.toFixed(2), "Inventário (valor)": +C.invValue.toFixed(2), Patrimônio: +C.patrimonio.toFixed(2), "Lucro realizado": +C.realized.toFixed(2), Resultado: +C.resultado.toFixed(2), Itens: C.held.length });
-    [["Resumo", R], ["Lançamentos", L], ["Inventário", I], ["Vendas", V]].forEach(([n, rows]) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{}]), n));
+    const K = [...(X.capital || [])].sort((a, b) => capWhen(a) - capWhen(b)).map((m) => ({ Data: m.date, Hora: m.time || "", Site: m.site, Conta: X.nick(m.account), Tipo: m.kind === "dep" ? "Depósito" : "Saque", Método: m.method || "", Valor: +(+m.value).toFixed(2), Situação: CAP_STATUS[m.status] || "", Transferência: m.transfer ? "sim" : "", ID: m.ref || "" }));
+    [["Resumo", R], ["Lançamentos", L], ["Inventário", I], ["Vendas", V], ...(K.length ? [["Capital", K]] : [])].forEach(([n, rows]) => XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(rows.length ? rows : [{}]), n));
     const out = XLSX.write(wb, { bookType: "xlsx", type: "array" });
     saveFileLocal(`skindesk-${today()}.xlsx`, out, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
     toast("Planilha salva na pasta de downloads");
@@ -3787,7 +4057,9 @@ function App() {
 
   const acctOf = useMemo(() => Object.fromEntries(cfg.wallets.map((w) => [w.id, w.account])), [cfg.wallets]);
   const entries = useMemo(() => Object.values(S.months).flat(), [S.months]);
-  const C = useMemo(() => { const t0 = performance.now(); const r = compute(entries, S.values, acctOf); PERF.compute = performance.now() - t0; return r; }, [entries, S.values, acctOf]);
+  const capCut = capCutoff(cfg, entries);
+  const capA = useMemo(() => capAgg(S.capital, capCut, cfg.capitalUse), [S.capital, capCut, cfg.capitalUse]);
+  const C = useMemo(() => { const t0 = performance.now(); const r = compute(entries, S.values, acctOf, undefined, capA); PERF.compute = performance.now() - t0; return r; }, [entries, S.values, acctOf, capA]);
   const locs = useMemo(() => [...new Set([...Object.values(C.items).map((it) => it.loc || ""), ...Object.values(S.meta).map((m) => (m.loc && m.loc !== "-" ? m.loc : ""))].filter(Boolean))].sort(natSort), [C.items, S.meta]);
   const skinList = useMemo(() => { const rm = new Set(cfg.skinsRemove); const on = (cfg.skinsOnline && cfg.skinsOnline.names) || []; return [...new Set([...SKINS, ...on, ...cfg.skinsAdd])].filter((s) => !rm.has(s)).sort(); }, [cfg.skinsAdd, cfg.skinsRemove, cfg.skinsOnline]);
   const rarMap = useMemo(() => ({ ...SKIN_RARITY, ...((cfg.skinsOnline && cfg.skinsOnline.rarity) || {}) }), [cfg.skinsOnline]);
@@ -3804,13 +4076,13 @@ function App() {
     const accMap = Object.fromEntries(cfg.accounts.map((a) => [a.id, a]));
     const wMap = Object.fromEntries(cfg.wallets.map((w) => [w.id, w]));
     return {
-      sellSite: cfg.sites.find((x) => x.name === cfg.defaultSellSite) || null, locs, projects: S.projects, wish: S.wish, audit: S.audit, saveProjects: S.saveProjects, saveWish: S.saveWish, ask: (o) => setConfirm(o), rarityOf: (n) => rarMap[n] || "", catOf: (n) => catOf[n] || "", itemCount: itemNames.length, cfg, accounts: cfg.accounts, wallets: cfg.wallets, sites: cfg.sites, skinList, meta: S.meta, prices: S.prices, recon: S.recon,
+      sellSite: cfg.sites.find((x) => x.name === cfg.defaultSellSite) || null, capital: S.capital, locs, projects: S.projects, wish: S.wish, audit: S.audit, saveProjects: S.saveProjects, saveWish: S.saveWish, ask: (o) => setConfirm(o), rarityOf: (n) => rarMap[n] || "", catOf: (n) => catOf[n] || "", itemCount: itemNames.length, cfg, accounts: cfg.accounts, wallets: cfg.wallets, sites: cfg.sites, skinList, meta: S.meta, prices: S.prices, recon: S.recon,
       acc: (id) => accMap[id] || null,
       nick: (id) => (accMap[id] || {}).nick || "",
       accOfWallet: (id) => (wMap[id] || {}).account || "",
       wl: (id) => { const w = wMap[id]; if (!w) return id || "—"; const a = accMap[w.account]; return a ? `${w.name} · ${a.nick}` : w.name; },
     };
-  }, [cfg, skinList, rarMap, catOf, itemNames.length, S.meta, S.prices, S.recon, locs, S.projects, S.wish, S.audit]);
+  }, [cfg, skinList, rarMap, catOf, itemNames.length, S.meta, S.prices, S.recon, locs, S.projects, S.wish, S.audit, S.capital]);
   const [unlocked, setUnlocked] = useState(false);
   const [confirm, setConfirm] = useState(null);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -3932,6 +4204,7 @@ function App() {
       ${view === "historico" ? html`<${Historico} ...${common} preset=${preset} key=${"h" + (preset || "")} />` : null}
       ${view === "projetos" ? html`<${Projetos} ...${common} />` : null}
       ${view === "relatorios" ? html`<${Relatorios} ...${common} saveConfig=${S.saveConfig} acctOf=${acctOf} />` : null}
+      ${view === "capital" ? html`<${Capital} ...${common} saveConfig=${S.saveConfig} capital=${S.capital} saveCapital=${S.saveCapital} toast=${toast} />` : null}
       ${view === "calculadora" ? html`<${Calculadora} ...${common} />` : null}
       ${view === "taxas" ? html`<${Taxas} ...${common} saveConfig=${S.saveConfig} />` : null}
       ${view === "config" ? html`<${Config} ...${common} preset=${preset} key=${"c" + (preset || "")} saveConfig=${S.saveConfig} change=${S.change} toast=${toast} backup=${S.backup} restore=${S.restore} trash=${S.trash} purgeTrash=${S.purgeTrash} doBackup=${doBackup} addRecon=${S.addRecon} sync=${sync} data=${S.data} storeMode=${S.storeMode} replaceAll=${S.replaceAll} link=${link} />` : null}
